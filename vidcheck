@@ -1,0 +1,490 @@
+#!/bin/bash
+# vidcheck - Video quality checker
+# Analyzes video files and displays resolution, HDR, and audio quality information
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Colors for output
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat << EOF
+Usage: vidcheck <file>
+
+Analyzes video files and displays quality information for:
+  • Resolution (with quality rating)
+  • HDR format (Dolby Vision profiles, HDR10+, HDR10, HLG)
+  • Audio format (Atmos, DTS:X, TrueHD, DTS-HD MA, etc.)
+
+Formats with ✅⚠️ are high quality but limited on Apple TV + Infuse:
+  • Dolby Vision Profile 7 → no Dolby Vision (falls back to HDR10)
+  • HDR10+ → no HDR10+ (falls back to HDR10)
+  • Dolby Atmos TrueHD → no Atmos (decodes to lossless 7.1)
+  • DTS:X → no DTS:X (decodes to lossless 7.1)
+
+Supported formats: .mov, .mp4, .mkv, .avi, .webm, .m4v, .wmv, .flv, .ts, .mts, .m2ts
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version number
+  -j, --json     Output as JSON
+
+Examples:
+  vidcheck "Movie Name (2024).mkv"
+  vidcheck /path/to/video.mp4
+EOF
+}
+
+# Check for ffprobe
+check_dependencies() {
+    if ! command -v ffprobe &> /dev/null; then
+        echo "Error: ffprobe not found. Install ffmpeg:" >&2
+        echo "  brew install ffmpeg" >&2
+        exit 1
+    fi
+}
+
+# Get resolution rating
+get_resolution_info() {
+    local width="$1"
+    local height="$2"
+    local scan_type="$3"  # p or i
+    
+    local interlaced=""
+    [[ "$scan_type" == "i" ]] && interlaced="i" || interlaced="p"
+    
+    # Determine resolution category based on height
+    local res_name icon
+    if (( height >= 4320 )); then
+        res_name="4320p"
+        icon="✅"
+    elif (( height >= 2160 )); then
+        res_name="2160p"
+        icon="✅"
+    elif (( height >= 1440 )); then
+        res_name="1440p"
+        icon="👍"
+    elif (( height >= 1080 )); then
+        if [[ "$interlaced" == "i" ]]; then
+            res_name="1080i"
+            icon="⚠️"
+        else
+            res_name="1080p"
+            icon="👍"
+        fi
+    elif (( height >= 720 )); then
+        if [[ "$interlaced" == "i" ]]; then
+            res_name="720i"
+            icon="⚠️"
+        else
+            res_name="720p"
+            icon="⚠️"
+        fi
+    elif (( height >= 480 )); then
+        if [[ "$interlaced" == "i" ]]; then
+            res_name="480i"
+            icon="❌"
+        else
+            res_name="480p"
+            icon="❌"
+        fi
+    elif (( height >= 360 )); then
+        res_name="360p"
+        icon="❌"
+    else
+        res_name="${height}p"
+        icon="❌"
+    fi
+    
+    echo "${icon} ${res_name} (${width}×${height})"
+}
+
+# Detect HDR format with Apple TV compatibility
+get_hdr_info() {
+    local color_transfer="$1"
+    local color_primaries="$2"
+    local side_data="$3"
+    local dv_info="$4"  # Contains "profile:bl_compatibility" or empty
+    
+    # Check for Dolby Vision with profile info
+    if [[ -n "$dv_info" ]] && [[ "$dv_info" != ":" ]]; then
+        local dv_profile="${dv_info%%:*}"
+        local dv_bl="${dv_info##*:}"
+        
+        if [[ "$dv_profile" == "7" ]]; then
+            # Profile 7 = UHD Blu-ray dual-layer, NOT supported on Apple TV
+            echo "✅⚠️ Dolby Vision Profile 7 \033[3;90m(no Dolby Vision on Apple TV – falls back to HDR10)\033[0m"
+        elif [[ "$dv_profile" == "8" ]]; then
+            # Profile 8 sub-profiles - all supported on Apple TV via Infuse
+            if [[ "$dv_bl" == "1" ]]; then
+                echo "✅ Dolby Vision Profile 8.1"
+            elif [[ "$dv_bl" == "2" ]]; then
+                echo "✅ Dolby Vision Profile 8.2"
+            elif [[ "$dv_bl" == "4" ]]; then
+                echo "✅ Dolby Vision Profile 8.4"
+            else
+                echo "✅ Dolby Vision Profile 8"
+            fi
+        elif [[ "$dv_profile" == "5" ]]; then
+            # Profile 5 = streaming, native Apple TV support
+            echo "✅ Dolby Vision Profile 5"
+        else
+            echo "✅ Dolby Vision Profile ${dv_profile}"
+        fi
+        return
+    fi
+    
+    # Check for HDR10+ (NOT supported on Apple TV)
+    if [[ "$side_data" == *"HDR10+"* ]] || [[ "$side_data" == *"HDR10Plus"* ]] || [[ "$side_data" == *"SMPTE2094"* ]]; then
+        echo "✅⚠️ HDR10+ \033[3;90m(no HDR10+ on Apple TV – falls back to HDR10)\033[0m"
+        return
+    fi
+    
+    # Check for HDR10 (PQ transfer + BT.2020 primaries)
+    if [[ "$color_transfer" == "smpte2084" ]] || [[ "$color_transfer" == "arib-std-b67" ]]; then
+        if [[ "$color_primaries" == "bt2020" ]]; then
+            if [[ "$color_transfer" == "arib-std-b67" ]]; then
+                echo "✅ HLG"
+            else
+                echo "✅ HDR10"
+            fi
+            return
+        fi
+    fi
+    
+    echo "❌ SDR"
+}
+
+# Detect audio format with Apple TV compatibility
+get_audio_info() {
+    local codec="$1"
+    local channels="$2"
+    local channel_layout="$3"
+    local profile="$4"
+    local has_atmos="$5"
+    local has_dtsx="$6"
+    
+    # Determine base format name and Apple TV compatibility
+    local format_name=""
+    local icon=""
+    local atv_warning=""
+    
+    # Check for Atmos
+    if [[ "$has_atmos" == "true" ]]; then
+        if [[ "$codec" == "truehd" ]]; then
+            # TrueHD Atmos - Apple TV decodes to LPCM, loses Atmos metadata
+            format_name="Dolby Atmos TrueHD"
+            icon="✅⚠️"
+            atv_warning=" \033[3;90m(no Atmos on Apple TV – decodes to lossless 7.1)\033[0m"
+        elif [[ "$codec" == "eac3" ]]; then
+            # EAC3 Atmos - native Apple TV support
+            format_name="Dolby Atmos EAC3"
+            icon="✅"
+        else
+            format_name="Dolby Atmos (${codec})"
+            icon="✅"
+        fi
+        echo "${icon} ${format_name} (${channels}ch)${atv_warning}"
+        return
+    fi
+    
+    # Check for DTS:X
+    if [[ "$has_dtsx" == "true" ]]; then
+        # DTS:X - Apple TV decodes to LPCM, loses height channels
+        format_name="DTS:X"
+        icon="✅⚠️"
+        atv_warning=" \033[3;90m(no DTS:X on Apple TV – decodes to lossless 7.1)\033[0m"
+        echo "${icon} ${format_name} (${channels}ch)${atv_warning}"
+        return
+    fi
+    
+    # Non-immersive formats
+    if [[ "$codec" == "truehd" ]]; then
+        # TrueHD without Atmos - lossless decode to LPCM on Apple TV
+        format_name="TrueHD"
+        icon="✅"
+    elif [[ "$codec" == "dts" ]]; then
+        if [[ "$profile" == *"MA"* ]] || [[ "$profile" == *"HD MA"* ]]; then
+            # DTS-HD MA - lossless decode to LPCM on Apple TV
+            format_name="DTS-HD MA"
+            icon="✅"
+        elif [[ "$profile" == *"HD"* ]]; then
+            format_name="DTS-HD"
+            icon="✅"
+        else
+            format_name="DTS"
+            icon="👍"
+        fi
+    elif [[ "$codec" == "eac3" ]]; then
+        format_name="EAC3"
+        icon="✅"
+    elif [[ "$codec" == "ac3" ]]; then
+        format_name="AC3"
+        icon="👍"
+    elif [[ "$codec" == "flac" ]]; then
+        format_name="FLAC"
+        icon="✅"
+    elif [[ "$codec" == "pcm"* ]] || [[ "$codec" == "wav" ]]; then
+        format_name="PCM"
+        icon="✅"
+    elif [[ "$codec" == "aac" ]]; then
+        format_name="AAC"
+        icon="👍"
+    elif [[ "$codec" == "opus" ]]; then
+        format_name="Opus"
+        icon="👍"
+    elif [[ "$codec" == "mp3" ]]; then
+        format_name="MP3"
+        icon="⚠️"
+    else
+        format_name="${codec^^}"
+        icon="👍"
+    fi
+    
+    # Add channel configuration
+    local channel_desc=""
+    if (( channels >= 8 )); then
+        channel_desc="7.1"
+    elif (( channels >= 6 )); then
+        channel_desc="5.1"
+    elif (( channels == 2 )); then
+        channel_desc="Stereo"
+        # Downgrade icon for stereo
+        [[ "$icon" == "✅" ]] && icon="⚠️"
+        [[ "$icon" == "👍" ]] && icon="⚠️"
+    elif (( channels == 1 )); then
+        channel_desc="Mono"
+        icon="❌"
+    else
+        channel_desc="${channels}ch"
+    fi
+    
+    echo "${icon} ${format_name} ${channel_desc}${atv_warning}"
+}
+
+# Main analysis function
+analyze_video() {
+    local file="$1"
+    local json_output="${2:-false}"
+    
+    if [[ ! -f "$file" ]]; then
+        echo "Error: File not found: $file" >&2
+        exit 1
+    fi
+    
+    # Get all stream info as JSON and parse with Python for reliability
+    local parsed_data
+    parsed_data=$(ffprobe -v quiet -print_format json -show_streams -show_format "$file" 2>/dev/null | python3 -c "
+import sys, json
+
+try:
+    data = json.load(sys.stdin)
+except:
+    print('ERROR:Could not parse video')
+    sys.exit(1)
+
+# Find video stream
+video = None
+audio = None
+for s in data.get('streams', []):
+    if s.get('codec_type') == 'video' and video is None:
+        video = s
+    if s.get('codec_type') == 'audio' and audio is None:
+        audio = s
+
+if not video:
+    print('ERROR:No video stream found')
+    sys.exit(1)
+
+# Extract video info
+width = video.get('width', 0)
+height = video.get('height', 0)
+field_order = video.get('field_order', 'progressive')
+color_transfer = video.get('color_transfer', '')
+color_primaries = video.get('color_primaries', '')
+
+# Check for HDR metadata in side_data
+side_data_str = ''
+dv_profile = ''
+dv_bl_compatibility = ''
+
+for sd in video.get('side_data_list', []):
+    side_data_str += json.dumps(sd)
+    # Check for Dolby Vision configuration
+    if sd.get('side_data_type') == 'DOVI configuration record':
+        dv_profile = str(sd.get('dv_profile', ''))
+        dv_bl_compatibility = str(sd.get('dv_bl_signal_compatibility_id', ''))
+    # Alternative key names
+    if 'dv_profile' in sd:
+        dv_profile = str(sd.get('dv_profile', ''))
+    if 'dv_bl_signal_compatibility_id' in sd:
+        dv_bl_compatibility = str(sd.get('dv_bl_signal_compatibility_id', ''))
+
+# Also check video stream directly for DV info
+if not dv_profile and 'dv_profile' in video:
+    dv_profile = str(video.get('dv_profile', ''))
+if not dv_bl_compatibility and 'dv_bl_signal_compatibility_id' in video:
+    dv_bl_compatibility = str(video.get('dv_bl_signal_compatibility_id', ''))
+
+# Combine DV info
+dv_info = f'{dv_profile}:{dv_bl_compatibility}'
+
+# Extract audio info
+audio_codec = audio.get('codec_name', '') if audio else ''
+audio_channels = audio.get('channels', 0) if audio else 0
+audio_layout = audio.get('channel_layout', '') if audio else ''
+audio_profile = str(audio.get('profile', '')) if audio else ''
+
+# Check for Atmos in audio side data
+has_atmos = 'false'
+has_dtsx = 'false'
+if audio:
+    for sd in audio.get('side_data_list', []):
+        sd_str = json.dumps(sd).lower()
+        if 'atmos' in sd_str or 'joc' in sd_str:
+            has_atmos = 'true'
+    # Also check profile for atmos/dtsx indication
+    profile_lower = audio_profile.lower()
+    if 'atmos' in profile_lower:
+        has_atmos = 'true'
+    if 'dts:x' in profile_lower or 'dts-x' in profile_lower or 'dtsx' in profile_lower or profile_lower == 'x':
+        has_dtsx = 'true'
+    # Check for DTS:X in format tags
+    tags = audio.get('tags', {})
+    for k, v in tags.items():
+        v_lower = str(v).lower()
+        if 'atmos' in v_lower:
+            has_atmos = 'true'
+        if 'dts:x' in v_lower or 'dts-x' in v_lower or 'dtsx' in v_lower:
+            has_dtsx = 'true'
+    # Check codec_long_name for DTS:X
+    codec_long = audio.get('codec_long_name', '').lower()
+    if 'dts-hd' in codec_long and 'x' in audio_profile.lower():
+        has_dtsx = 'true'
+
+# Output parsed values
+print(f'WIDTH:{width}')
+print(f'HEIGHT:{height}')
+print(f'FIELD_ORDER:{field_order}')
+print(f'COLOR_TRANSFER:{color_transfer}')
+print(f'COLOR_PRIMARIES:{color_primaries}')
+print(f'SIDE_DATA:{side_data_str}')
+print(f'DV_INFO:{dv_info}')
+print(f'AUDIO_CODEC:{audio_codec}')
+print(f'AUDIO_CHANNELS:{audio_channels}')
+print(f'AUDIO_LAYOUT:{audio_layout}')
+print(f'AUDIO_PROFILE:{audio_profile}')
+print(f'HAS_ATMOS:{has_atmos}')
+print(f'HAS_DTSX:{has_dtsx}')
+" 2>/dev/null) || {
+        echo "Error: Could not analyze file. Is it a valid video?" >&2
+        exit 1
+    }
+    
+    # Check for errors
+    if [[ "$parsed_data" == ERROR:* ]]; then
+        echo "Error: ${parsed_data#ERROR:}" >&2
+        exit 1
+    fi
+    
+    # Parse the output
+    local video_width video_height field_order color_transfer color_primaries side_data dv_info
+    local audio_codec audio_channels audio_layout audio_profile has_atmos has_dtsx
+    
+    video_width=$(echo "$parsed_data" | grep '^WIDTH:' | cut -d: -f2)
+    video_height=$(echo "$parsed_data" | grep '^HEIGHT:' | cut -d: -f2)
+    field_order=$(echo "$parsed_data" | grep '^FIELD_ORDER:' | cut -d: -f2)
+    color_transfer=$(echo "$parsed_data" | grep '^COLOR_TRANSFER:' | cut -d: -f2)
+    color_primaries=$(echo "$parsed_data" | grep '^COLOR_PRIMARIES:' | cut -d: -f2)
+    side_data=$(echo "$parsed_data" | grep '^SIDE_DATA:' | cut -d: -f2-)
+    dv_info=$(echo "$parsed_data" | grep '^DV_INFO:' | cut -d: -f2-)
+    audio_codec=$(echo "$parsed_data" | grep '^AUDIO_CODEC:' | cut -d: -f2)
+    audio_channels=$(echo "$parsed_data" | grep '^AUDIO_CHANNELS:' | cut -d: -f2)
+    audio_layout=$(echo "$parsed_data" | grep '^AUDIO_LAYOUT:' | cut -d: -f2)
+    audio_profile=$(echo "$parsed_data" | grep '^AUDIO_PROFILE:' | cut -d: -f2)
+    has_atmos=$(echo "$parsed_data" | grep '^HAS_ATMOS:' | cut -d: -f2)
+    has_dtsx=$(echo "$parsed_data" | grep '^HAS_DTSX:' | cut -d: -f2)
+    
+    # Determine scan type
+    local scan_type="p"
+    if [[ "$field_order" == "tt" ]] || [[ "$field_order" == "bb" ]] || [[ "$field_order" == "tb" ]] || [[ "$field_order" == "bt" ]]; then
+        scan_type="i"
+    fi
+    
+    # Generate output
+    local res_info hdr_info audio_info
+    res_info=$(get_resolution_info "$video_width" "$video_height" "$scan_type")
+    hdr_info=$(get_hdr_info "$color_transfer" "$color_primaries" "$side_data" "$dv_info")
+    audio_info=$(get_audio_info "$audio_codec" "${audio_channels:-0}" "$audio_layout" "$audio_profile" "$has_atmos" "$has_dtsx")
+    
+    if [[ "$json_output" == "true" ]]; then
+        cat << EOF
+{
+  "resolution": "$res_info",
+  "hdr": "$hdr_info",
+  "audio": "$audio_info",
+  "details": {
+    "width": $video_width,
+    "height": $video_height,
+    "scan": "$scan_type",
+    "color_transfer": "$color_transfer",
+    "color_primaries": "$color_primaries",
+    "audio_codec": "$audio_codec",
+    "audio_channels": ${audio_channels:-0}
+  }
+}
+EOF
+    else
+        echo -e "${CYAN}Resolution:${NC} $res_info"
+        echo -e "${CYAN}HDR:${NC}        $hdr_info"
+        echo -e "${CYAN}Audio:${NC}      $audio_info"
+    fi
+}
+
+# Parse arguments
+main() {
+    local json_mode=false
+    local file=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "vidcheck $VERSION"
+                exit 0
+                ;;
+            -j|--json)
+                json_mode=true
+                shift
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+            *)
+                file="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$file" ]]; then
+        usage >&2
+        exit 1
+    fi
+    
+    check_dependencies
+    analyze_video "$file" "$json_mode"
+}
+
+main "$@"
